@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-import asyncio
+
+from aiohttp import web
 
 # ======================
 # CONFIG
@@ -17,6 +19,9 @@ import asyncio
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Set BOT_TOKEN env var (BOT_TOKEN)")
+
+# Render sets PORT for web services
+PORT = int(os.getenv("PORT", "10000"))
 
 TZ = ZoneInfo("Europe/Rome")
 DB = "expenses.db"
@@ -110,10 +115,6 @@ def delete_last_expense(chat_id: int):
         return row
 
 def parse_year_month(arg: str | None):
-    """
-    None -> current month
-    "YYYY-MM" -> that month
-    """
     if not arg:
         now = datetime.now(TZ)
         y, m = now.year, now.month
@@ -180,51 +181,34 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-CATEGORIES_NORM = {normalize(c): c for c in CATEGORIES}  # normalized -> original
+CATEGORIES_NORM = {normalize(c): c for c in CATEGORIES}
 ALIASES_NORM = {normalize(k): normalize(v) for k, v in ALIASES.items()}
 
 def resolve_category(rest: str):
-    """
-    Finds category at beginning of string:
-      "доставка еды суши" -> ("доставка еды", "суши")
-      "такси" -> ("такси", None)
-    """
     rest_n = normalize(rest)
-
-    # alias by first word
     first = rest_n.split(" ", 1)[0]
     if first in ALIASES_NORM:
         mapped = ALIASES_NORM[first]
         rest_n = mapped + ("" if len(rest_n) == len(first) else " " + rest_n[len(first)+1:])
 
-    # match longest first
     for cat_norm in sorted(CATEGORIES_NORM.keys(), key=len, reverse=True):
         if rest_n == cat_norm:
             return CATEGORIES_NORM[cat_norm], None
         if rest_n.startswith(cat_norm + " "):
             note = rest_n[len(cat_norm) + 1:].strip()
             return CATEGORIES_NORM[cat_norm], note
-
     return None, None
 
 def parse_expense_text(text: str) -> ParsedExpense | None:
-    """
-    Expected:
-      250 продукты
-      45 доставка еды суши
-    """
     text = (text or "").strip()
     m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+(.+)$", text)
     if not m:
         return None
-
     amount = float(m.group(1).replace(",", "."))
     rest = m.group(2).strip()
-
     category, note = resolve_category(rest)
     if not category:
         return None
-
     return ParsedExpense(amount=amount, category=category, note=note)
 
 def format_money(x: float) -> str:
@@ -234,9 +218,29 @@ def format_money(x: float) -> str:
     return s
 
 # ======================
+# HTTP keep-alive server
+# ======================
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+async def run_web_server() -> None:
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_get("/", health)  # чтобы и корень отвечал
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    # держим таск живым
+    while True:
+        await asyncio.sleep(3600)
+
+# ======================
 # BOT
 # ======================
-async def main():
+async def run_bot() -> None:
     init_db()
     bot = Bot(TOKEN)
     dp = Dispatcher()
@@ -245,7 +249,7 @@ async def main():
     async def start(m: types.Message):
         await m.answer(
             "Привет! Я бот для учёта расходов.\n"
-            "Если вы в группе — убедитесь, что privacy у бота выключен: @BotFather → /setprivacy → Disable.\n\n"
+            "Для групп: отключи privacy у бота в @BotFather → /setprivacy → Disable.\n\n"
             + HELP_TEXT,
             parse_mode="Markdown"
         )
@@ -300,7 +304,6 @@ async def main():
         except Exception:
             dt_s = created_at
 
-        # В группе не палим имена, просто user_id (можно убрать вообще)
         who = f" (user_id {uid})" if is_group(m.chat) else ""
         await m.answer(f"↩️ Удалил последнюю запись{who}:\n{dt_s} — {format_money(float(amount))} — {category}{note_part}")
 
@@ -341,16 +344,13 @@ async def main():
 
     @dp.message()
     async def any_text(m: types.Message):
-        # Игнорируем сообщения от самого бота
         if m.from_user and m.from_user.is_bot:
             return
 
         parsed = parse_expense_text(m.text or "")
         if not parsed:
-            # В группе молчим, чтобы не мешать
             if is_group(m.chat):
                 return
-
             await m.answer(
                 "Не понял формат 😅\n\n"
                 "Пиши так: `250 продукты` или `45 доставка еды суши`\n"
@@ -363,7 +363,6 @@ async def main():
         add_expense(m.chat.id, m.from_user.id, parsed.amount, parsed.category, parsed.note)
 
         if is_group(m.chat):
-            # Короткий ответ в группе
             await m.reply(f"✅ {format_money(parsed.amount)} — {parsed.category}")
             return
 
@@ -374,6 +373,13 @@ async def main():
         )
 
     await dp.start_polling(bot)
+
+async def main():
+    # одновременно: web server + telegram polling
+    await asyncio.gather(
+        run_web_server(),
+        run_bot()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
